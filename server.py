@@ -5,8 +5,9 @@ import random
 import socket
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
-from protocol import Kind, Mode, Op, Writer, pack, unpack, read_arguments, reply_body, read_reply
+from protocol import Kind, Mode, Op, FlightStatus, TIME_FIELDS, Writer, pack, unpack, read_arguments, reply_body, read_reply
 
 
 class FlightServer:
@@ -26,8 +27,17 @@ class FlightServer:
             102: dict(id=102, source='Singapore', destination='Tokyo', departure=departure+3600, fare=550.0, seats=50),
             103: dict(id=103, source='Singapore', destination='Shanghai', departure=departure+7200, fare=350.0, seats=80),
         }
+        for flight in self.flights.values():
+            dt = datetime.fromtimestamp(flight['departure'], timezone.utc)
+            flight['departure'] = {field: getattr(dt, field) for field in TIME_FIELDS}
+            flight.update(flight_status=FlightStatus.ON_TIME, delay_minutes=0,
+                          total_baggage_kg=0.0, total_baggage_cost=0.0)
+        # Exact decimal accumulation internally; wire format is explicitly f64.
+        self.baggage_weights = {flight_id: Decimal('0') for flight_id in self.flights}
         # Lifetime history deliberately retained: eviction would weaken AMO guarantees.
         self.history = {}
+        # Registration replay preserves the original lease even in ALO mode.
+        self.monitor_history = {}
         self.subscriptions = {}
         self.running = True
         self.stats = dict(executed=0, duplicates=0, requests_dropped=0, replies_dropped=0)
@@ -70,6 +80,16 @@ class FlightServer:
         if op == Op.DETAILS:
             return flight
         value = args[1]
+        if op == Op.UPDATE_STATUS:
+            try:
+                status = FlightStatus(value)
+            except ValueError:
+                raise ValueError('Status must be 0 (on time), 1 (maintenance), or 2 (weather delay)')
+            delay = args[2]
+            if status == FlightStatus.ON_TIME and delay != 0:
+                raise ValueError('On-time flights must have zero delay')
+            flight.update(flight_status=status, delay_minutes=delay)
+            return dict(flight_status=status, delay_minutes=delay)
         if op == Op.RESERVE:
             if value <= 0 or value > flight['seats']:
                 raise ValueError('Seat count must be positive and no greater than availability')
@@ -85,11 +105,15 @@ class FlightServer:
                 client_id=client_id, request_id=request_id, flight_id=flight_id,
                 expires=time.monotonic()+value, address=address, sequence=0)
             return value
-        fare = value if op == Op.SET_FARE else flight['fare'] + value
-        if value < 0 or not math.isfinite(fare) or fare > 1e9:
-            raise ValueError('Fare/increment must be nonnegative and resulting fare <= 1e9')
-        flight['fare'] = fare
-        return fare
+        if value <= 0:
+            raise ValueError('Extra baggage weight must be positive')
+        total = self.baggage_weights[flight_id] + Decimal(str(value))
+        if total > Decimal('1000000'):
+            raise ValueError('Total baggage must not exceed 1000000 kg')
+        cost = (total * Decimal('15.50')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        self.baggage_weights[flight_id] = total
+        flight.update(total_baggage_kg=float(total), total_baggage_cost=float(cost))
+        return dict(total_baggage_kg=float(total), total_baggage_cost=float(cost))
 
     def handle(self, data, address):
         try:
@@ -106,11 +130,13 @@ class FlightServer:
         self.log(f'REQUEST {address} id={request_id} op={op.name}')
         key = (client_id, request_id)
         signature = (op, body)
+        history = self.monitor_history if mode == Mode.ALO and op == Op.MONITOR else self.history
+        use_history = mode == Mode.AMO or op == Op.MONITOR
         if mode != self.mode:
             response = pack(Kind.REPLY, mode, op, client_id, request_id,
                             reply_body(op, 2, 'Client/server invocation modes differ'))
-        elif mode == Mode.AMO and key in self.history:
-            previous, response = self.history[key]
+        elif use_history and key in history:
+            previous, response = history[key]
             if signature != previous:
                 response = pack(Kind.REPLY, mode, op, client_id, request_id,
                                 reply_body(op, 3, 'Request ID reused with different arguments'))
@@ -127,8 +153,8 @@ class FlightServer:
             except (ValueError, UnicodeError, OverflowError) as exc:
                 payload = reply_body(op, 1, str(exc))
             response = pack(Kind.REPLY, mode, op, client_id, request_id, payload)
-            if mode == Mode.AMO:
-                self.history[key] = (signature, response)
+            if use_history:
+                history[key] = (signature, response)
         if self.drop_first_reply or self.random.random() < self.reply_loss:
             self.drop_first_reply = False
             self.stats['replies_dropped'] += 1

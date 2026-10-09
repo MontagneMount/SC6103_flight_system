@@ -7,7 +7,7 @@ import time
 import unittest
 
 from client import FlightClient
-from protocol import Kind, Mode, Op, Reader, Writer, arguments, pack, unpack, read_reply
+from protocol import Kind, Mode, Op, Reader, Writer, arguments, pack, unpack, read_reply, read_arguments, reply_body
 from server import FlightServer
 
 
@@ -59,12 +59,78 @@ class SystemTests(unittest.TestCase):
             self.assertNotEqual(client.call(Op.RESERVE, 101, quantity)['status'], 0)
         self.assertEqual(client.call(Op.DETAILS, 101)['result']['seats'], 98)
         for _ in range(2):
-            self.assertEqual(client.call(Op.SET_FARE, 101, 600)['result'], 600)
-        self.assertEqual(client.call(Op.ADD_FARE, 101, 10)['result'], 610)
-        self.assertEqual(client.call(Op.ADD_FARE, 101, 10)['result'], 620)
-        for value in [-1, float('nan'), float('inf')]:
-            self.assertNotEqual(client.call(Op.SET_FARE, 101, value)['status'], 0)
+            self.assertEqual(client.call(Op.UPDATE_STATUS, 101, 'weather-delay', 30)['result'],
+                             dict(flight_status=2, delay_minutes=30))
+        self.assertEqual(client.call(Op.ADD_BAGGAGE, 101, 2.5)['result'],
+                         dict(total_baggage_kg=2.5, total_baggage_cost=38.75))
+        self.assertEqual(client.call(Op.ADD_BAGGAGE, 101, 1.5)['result'],
+                         dict(total_baggage_kg=4.0, total_baggage_cost=62.0))
+        for value in [-1, 0, float('nan'), float('inf'), 1000001]:
+            self.assertNotEqual(client.call(Op.ADD_BAGGAGE, 101, value)['status'], 0)
+        for status, delay in [(3, 0), (0, 30)]:
+            self.assertNotEqual(client.call(Op.UPDATE_STATUS, 101, status, delay)['status'], 0)
+        state = client.call(Op.DETAILS, 101)['result']
+        self.assertEqual(state['departure'], dict(year=2026, month=10, day=20, hour=2, minute=0))
+        self.assertEqual(state['flight_status'], 2)
+        self.assertEqual(state['total_baggage_cost'], 62)
+        self.assertEqual(state['fare'], 500)
+        self.assertEqual(client.call(Op.DETAILS, 103)['result']['total_baggage_kg'], 0)
         self.assertNotEqual(client.call(Op.MONITOR, 101, 0)['status'], 0)
+
+    def test_new_operations_under_lost_replies(self):
+        for mode, weight, cost in [(Mode.ALO, 4, 62), (Mode.AMO, 2, 31)]:
+            server = self.start(mode, drop_first_reply=True)
+            client = self.client(server)
+            self.assertEqual(client.call(Op.ADD_BAGGAGE, 101, 2)['result'],
+                             dict(total_baggage_kg=weight, total_baggage_cost=cost))
+            self.assertEqual(client.last_attempts, 2)
+            server.drop_first_reply = True
+            self.assertEqual(client.call(Op.UPDATE_STATUS, 101, 'maintenance', 45)['result'],
+                             dict(flight_status=1, delay_minutes=45))
+            self.assertEqual(client.last_attempts, 2)
+            self.assertEqual(client.call(Op.UPDATE_STATUS, 101, 'on-time', 0)['result'],
+                             dict(flight_status=0, delay_minutes=0))
+
+    def test_monitor_replay_preserves_lease_even_after_expiry(self):
+        for mode in [Mode.ALO, Mode.AMO]:
+            server = self.start(mode)
+            client = self.client(server)
+            self.assertEqual(client.call(Op.MONITOR, 101, .15)['status'], 0)
+            key = (client.client_id, client.request_id)
+            original_expiry = server.subscriptions[key]['expires']
+            original_address = server.subscriptions[key]['address']
+            self.assertEqual(original_address[1], client.sock.getsockname()[1])
+            packet = pack(Kind.REQUEST, mode, Op.MONITOR, *key, arguments(Op.MONITOR, (101, .15)))
+            client.sock.sendto(packet, server.address)
+            client.receive(time.monotonic()+1)
+            self.assertEqual(server.subscriptions[key]['expires'], original_expiry)
+            time.sleep(.3)
+            client.sock.sendto(packet, server.address)
+            client.receive(time.monotonic()+1)
+            self.assertNotIn(key, server.subscriptions)
+
+    def test_v2_wire_layout_and_truncated_new_fields(self):
+        server = self.start()
+        body = reply_body(Op.DETAILS, 0, 'OK', server.flights[101])
+        r = Reader(body)
+        self.assertEqual((r.u32(), r.string(), r.u32(), r.string(), r.string()),
+                         (0, 'OK', 101, 'Singapore', 'Tokyo'))
+        self.assertEqual([r.u32() for _ in range(5)], [2026, 10, 20, 2, 0])
+        self.assertEqual(r.f64(), 500)
+        with self.assertRaises(ValueError):
+            read_reply(Op.DETAILS, body[:-1])
+        with self.assertRaises(ValueError):
+            read_arguments(Op.UPDATE_STATUS, Writer().u32(101).u32(2).data)
+        self.assertEqual(read_arguments(Op.UPDATE_STATUS, arguments(Op.UPDATE_STATUS, (101, '天气延误', 30))),
+                         (101, 2, 30))
+
+    def test_baggage_decimal_rounding(self):
+        server = self.start()
+        client = self.client(server)
+        client.call(Op.ADD_BAGGAGE, 101, .1)
+        self.assertEqual(client.call(Op.ADD_BAGGAGE, 101, .2)['result'],
+                         dict(total_baggage_kg=.3, total_baggage_cost=4.65))
+        self.assertEqual(client.call(Op.ADD_BAGGAGE, 103, .01)['result']['total_baggage_cost'], .16)
 
     def test_lost_reply_alo_reexecutes_amo_deduplicates(self):
         for mode, expected in [(Mode.ALO, 96), (Mode.AMO, 98)]:
@@ -147,6 +213,13 @@ class SystemTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('[101, 102]', result.stdout)
+        for args, expected in [(['update-status', '101', 'weather-delay', '30'], 'WEATHER_DELAY'),
+                               (['add-baggage', '101', '2'], '$31.00'),
+                               (['details', '101'], '2026-10-20 02:00 UTC')]:
+            result = subprocess.run([sys.executable, 'client.py', '--port', str(server.address[1]), *args],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected, result.stdout)
         actor = self.client(server)
         updates, failures = [], []
 

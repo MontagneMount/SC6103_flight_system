@@ -5,9 +5,8 @@ import socket
 import struct
 import time
 import uuid
-from datetime import datetime, timezone
 
-from protocol import Kind, Mode, Op, Reader, arguments, pack, unpack, read_reply
+from protocol import Kind, Mode, Op, FlightStatus, Reader, arguments, pack, unpack, read_reply
 
 
 class FlightClient:
@@ -107,15 +106,22 @@ def display(reply):
         print('ERROR:', reply['message'])
         return
     value = reply['result']
-    if isinstance(value, dict) and 'departure' in value:
+    if isinstance(value, dict):
         value = dict(value)
-        value['departure'] = datetime.fromtimestamp(value['departure'], timezone.utc).isoformat()
+        if 'departure' in value:
+            dt = value['departure']
+            value['departure'] = (f'{dt["year"]:04d}-{dt["month"]:02d}-{dt["day"]:02d} '
+                                  f'{dt["hour"]:02d}:{dt["minute"]:02d} UTC')
+        if 'flight_status' in value:
+            value['flight_status'] = FlightStatus(value['flight_status']).name
+        if 'total_baggage_cost' in value:
+            value['total_baggage_cost'] = f'${value["total_baggage_cost"]:.2f}'
     print('OK:', value)
 
 
 def menu(client):
     while True:
-        print('\n1 Search flights  2 Flight details  3 Reserve seats\n4 Monitor seats  5 Set fare  6 Increase fare  0 Exit')
+        print('\n1 Search flights  2 Flight details  3 Reserve seats\n4 Monitor seats  5 Update flight status  6 Buy extra baggage ($15.50/kg)  0 Exit')
         choice = input('Operation: ').strip()
         if choice == '0':
             return
@@ -127,8 +133,11 @@ def menu(client):
                 values = (int(input('Flight ID: ')),)
                 if op == Op.RESERVE:
                     values += (int(input('Seats to reserve: ')),)
-                elif op in (Op.MONITOR, Op.SET_FARE, Op.ADD_FARE):
-                    values += (float(input('Seconds: ' if op == Op.MONITOR else 'Amount: ')),)
+                elif op == Op.UPDATE_STATUS:
+                    values += (input('Status (0=on time, 1=maintenance, 2=weather delay): '),
+                               int(input('Delay minutes: ')))
+                elif op in (Op.MONITOR, Op.ADD_BAGGAGE):
+                    values += (float(input('Seconds: ' if op == Op.MONITOR else 'Extra baggage kg: ')),)
             display(client.monitor(*values) if op == Op.MONITOR else client.call(op, *values))
         except (ValueError, OverflowError, struct.error, OSError) as exc:
             print('ERROR:', exc)
@@ -141,14 +150,14 @@ if __name__ == '__main__':
     parser.add_argument('--mode', choices=['alo', 'amo'], default='amo')
     parser.add_argument('--timeout', type=float, default=1)
     parser.add_argument('--retries', type=int, default=3)
-    parser.add_argument('operation', nargs='?', choices=['search', 'details', 'reserve', 'monitor', 'set-fare', 'add-fare'])
+    parser.add_argument('operation', nargs='?', choices=['search', 'details', 'reserve', 'monitor', 'update-status', 'add-baggage'])
     parser.add_argument('values', nargs='*')
     args = parser.parse_args()
     client = FlightClient(args.host, args.port, Mode[args.mode.upper()], args.timeout, args.retries)
     try:
         if args.operation:
             op = Op[args.operation.replace('-', '_').upper()]
-            expected = 1 if op == Op.DETAILS else 2
+            expected = 1 if op == Op.DETAILS else (3 if op == Op.UPDATE_STATUS else 2)
             if len(args.values) != expected:
                 parser.error(f'{args.operation} requires {expected} arguments')
             if op == Op.MONITOR:
